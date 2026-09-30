@@ -1,5 +1,6 @@
-// The "dot": an LLM with memory, tools and scheduled tasks.
-// Provider = any OpenAI-compatible chat API (Groq, OpenRouter, Gemini, ...).
+// The "dot": an LLM with memory, tools and scheduled tasks. Models come from src/models.js.
+
+import { complete, modelChain } from "./models.js";
 
 const MAX_HISTORY = 20; // messages remembered per chat
 const HISTORY_TTL = 60 * 60 * 24 * 7; // forget chats idle for 7 days
@@ -23,8 +24,10 @@ const save = (env, key, value, opts) => env.CHAT.put(key, JSON.stringify(value),
 export const listFacts = (env, chatId) => load(env, `facts:${chatId}`, []);
 export const clearFacts = (env, chatId) => env.CHAT?.delete(`facts:${chatId}`);
 export const clearHistory = (env, chatId) => env.CHAT?.delete(`history:${chatId}`);
-export const setModel = (env, chatId, model) => env.CHAT?.put(`model:${chatId}`, model);
-export const currentModel = async (env, chatId) => (await env.CHAT?.get(`model:${chatId}`)) || env.LLM_MODEL;
+/** The model this chat picked with /model (tried first), or null to use MODEL_CHAIN order. */
+export const selectedModel = async (env, chatId) => (await env.CHAT?.get(`model:${chatId}`)) || null;
+export const setModel = (env, chatId, spec) =>
+  spec ? env.CHAT?.put(`model:${chatId}`, spec) : env.CHAT?.delete(`model:${chatId}`);
 
 // ---- time -----------------------------------------------------------------------------------
 
@@ -169,29 +172,23 @@ async function runTool(env, tools, call, ctx) {
   }
 }
 
-// ---- LLM ------------------------------------------------------------------------------------
+// ---- agent loop -----------------------------------------------------------------------------
 
-async function chat(env, model, messages, specs) {
-  const res = await fetch(`${env.LLM_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${env.LLM_API_KEY}` },
-    body: JSON.stringify({ model, messages, ...(specs.length ? { tools: specs } : {}) }),
-  });
-  if (!res.ok) {
-    const err = new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
-    err.status = res.status;
-    throw err;
-  }
-  return (await res.json()).choices[0].message;
-}
+// Reasoning models (DeepSeek, gpt-oss, ...) may put their thinking inline; don't show it.
+const stripThinking = (text) => text?.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+
+// Interactive replies run in waitUntil, which Workers cut off ~30s after the webhook returns: stay inside that.
+// Cron-triggered runs have far more time.
+const BUDGET_MS = { interactive: 25_000, scheduled: 100_000 };
 
 /** One user message in, one answer out. Runs the tool loop and updates history. */
 export async function runAgent(env, chatId, userText, { scheduled = false } = {}) {
   const history = await load(env, `history:${chatId}`, []);
   const facts = await listFacts(env, chatId);
-  const model = await currentModel(env, chatId);
+  const chain = modelChain(env, await selectedModel(env, chatId));
+  const until = Date.now() + (scheduled ? BUDGET_MS.scheduled : BUDGET_MS.interactive);
   const tools = enabledTools(env, scheduled);
-  let specs = tools.map(toSpec);
+  const specs = tools.map(toSpec);
 
   const system = [
     env.SYSTEM_PROMPT || DEFAULT_PROMPT,
@@ -206,22 +203,13 @@ export async function runAgent(env, chatId, userText, { scheduled = false } = {}
   const messages = [{ role: "system", content: system }, ...history, userMsg];
 
   let answer = "Kaam poora nahi ho paya (too many steps).";
+  let used = chain[0]?.label;
   for (let step = 0; step < MAX_STEPS; step++) {
-    let reply;
-    try {
-      reply = await chat(env, model, messages, specs);
-    } catch (e) {
-      // Many free models don't support tool calling: fall back to plain chat instead of failing.
-      if (step === 0 && specs.length && (e.status === 400 || e.status === 404)) {
-        console.warn(`model ${model} rejected tools, continuing without: ${e.message}`);
-        specs = [];
-        reply = await chat(env, model, messages, specs);
-      } else {
-        throw e;
-      }
-    }
+    const res = await complete(env, chain, messages, specs, until);
+    used = res.used;
+    const reply = res.message;
     if (!reply.tool_calls?.length) {
-      answer = reply.content?.trim() || "(empty reply)";
+      answer = stripThinking(reply.content) || "(empty reply)";
       break;
     }
     messages.push({ role: "assistant", content: reply.content ?? null, tool_calls: reply.tool_calls });
@@ -235,7 +223,8 @@ export async function runAgent(env, chatId, userText, { scheduled = false } = {}
     JSON.stringify([...history, userMsg, { role: "assistant", content: answer }].slice(-MAX_HISTORY)),
     { expirationTtl: HISTORY_TTL },
   );
-  return answer;
+  // Say so when a fallback model answered, so it's clear why the style changed.
+  return used !== chain[0].label ? `${answer}\n\n(via ${used})` : answer;
 }
 
 // ---- scheduler ------------------------------------------------------------------------------

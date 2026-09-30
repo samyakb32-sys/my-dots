@@ -1,8 +1,11 @@
 // Telegram front-end for the agent, as a Cloudflare Worker. No dependencies.
 
 import {
-  runAgent, takeDueReminders, listFacts, clearFacts, clearHistory, currentModel, setModel,
+  runAgent, takeDueReminders, listFacts, clearFacts, clearHistory, selectedModel, setModel,
 } from "./agent.js";
+import {
+  PRESETS, PROVIDERS, resolveModel, hasKey, modelChain, listProviderModels, checkModels,
+} from "./models.js";
 
 const TG_API = "https://api.telegram.org";
 const TG_LIMIT = 4000; // Telegram caps messages at 4096 chars
@@ -47,7 +50,11 @@ export async function handleUpdate(update, env) {
   const command = cmd.startsWith("/") ? cmd.split("@")[0] : null;
 
   if (command === "/start") {
-    return reply("Hi! Main tera always-on assistant hoon. Kuch bhi pooch, ya bol 'kal subah 8 baje yaad dilana'.\n/reset chat bhoolne ke liye, /memory jo yaad hai wo dekhne ke liye, /model model badalne ke liye.");
+    return reply(
+      "Hi! Main tera always-on assistant hoon. Kuch bhi pooch, ya bol 'kal subah 8 baje yaad dilana'.\n" +
+        "/model model chun ya dekh, /models list, /check test kar kaunsa chal raha hai, " +
+        "/memory jo yaad hai, /reset chat bhoolne ke liye.",
+    );
   }
   if (command === "/reset") {
     await clearHistory(env, chatId);
@@ -62,9 +69,58 @@ export async function handleUpdate(update, env) {
     return reply(facts.length ? facts.map((f) => `- ${f}`).join("\n") : "Abhi kuch yaad nahi.");
   }
   if (command === "/model") {
-    if (!args.length) return reply(`Current model: ${await currentModel(env, chatId)}`);
-    await setModel(env, chatId, args[0]);
-    return reply(`Model set to ${args[0]}`);
+    const [spec] = args;
+    if (!spec) {
+      const order = modelChain(env, await selectedModel(env, chatId)).map((m) => m.label);
+      return reply(
+        order.length
+          ? `Is order mein try hoga (fail hua to agla):\n${order.map((l, i) => `${i + 1}. ${l}`).join("\n")}\n\n` +
+              "Badalne ke liye: /model <naam> (naam ke liye /models). Wapas default: /model auto"
+          : "Koi model active nahi. Kisi provider ki API key secret daal (README dekh).",
+      );
+    }
+    if (spec === "auto") {
+      await setModel(env, chatId, null);
+      return reply("Default order wapas.");
+    }
+    const m = resolveModel(spec);
+    if (!m) return reply(`'${spec}' samajh nahi aaya. /models dekh, ya provider:model likh (e.g. nvidia:meta/llama-3.3-70b-instruct).`);
+    if (!hasKey(env, m.provider)) return reply(`${m.provider} ki key set nahi hai (${PROVIDERS[m.provider].keyEnv}).`);
+    await setModel(env, chatId, spec);
+    return reply(`Ab pehle ${m.label} try hoga, fail hua to baaki.`);
+  }
+  if (command === "/models") {
+    const [provider, filter = ""] = args;
+    if (!provider) {
+      const presets = Object.entries(PRESETS).map(([alias, spec]) => {
+        const m = resolveModel(spec);
+        return `${hasKey(env, m.provider) ? "✅" : "❌ key nahi"} ${alias} -> ${spec}`;
+      });
+      return reply(
+        `Short names:\n${presets.join("\n")}\n\nProviders: ${Object.keys(PROVIDERS).join(", ")}\n` +
+          "Live list: /models <provider> [filter], e.g. /models nvidia deepseek\n" +
+          "Koi bhi model: /model provider:model-id. Kaunsa chal raha hai: /check",
+      );
+    }
+    if (!PROVIDERS[provider]) return reply(`Unknown provider. Options: ${Object.keys(PROVIDERS).join(", ")}`);
+    if (!hasKey(env, provider)) return reply(`${provider} ki key set nahi hai (${PROVIDERS[provider].keyEnv}).`);
+    try {
+      const ids = await listProviderModels(env, provider, filter);
+      const shown = ids.slice(0, 60);
+      return reply(
+        ids.length
+          ? `${shown.join("\n")}${ids.length > shown.length ? `\n... aur ${ids.length - shown.length} (filter laga)` : ""}`
+          : "Kuch nahi mila.",
+      );
+    } catch (e) {
+      return reply(`List nahi mili: ${e.message}`);
+    }
+  }
+  if (command === "/check") {
+    const chain = modelChain(env, await selectedModel(env, chatId));
+    if (!chain.length) return reply("Koi model active nahi. Kisi provider ki API key secret daal (README dekh).");
+    await tg(env, "sendChatAction", { chat_id: chatId, action: "typing" });
+    return reply((await checkModels(env, chain)).join("\n"));
   }
 
   await tg(env, "sendChatAction", { chat_id: chatId, action: "typing" });
