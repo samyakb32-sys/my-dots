@@ -6,11 +6,26 @@ import { complete, modelChain } from "../src/models.js";
 const GROQ = "api.groq.com";
 const NVIDIA = "integrate.api.nvidia.com";
 
-let calls; // every outbound fetch: { url, body }
+let calls; // every outbound fetch: { url, body, headers }
 let llmReply;
 let llmQueue; // scripted assistant messages, consumed in order; then plain llmReply
 let failHosts; // host -> HTTP status, or "throw" for a network error
 let rejectTools; // every provider answers 400 when a request carries tools
+let tgFiles; // file_id -> { bytes, size? } for files "uploaded" by the user
+let transcript; // what Groq Whisper "hears"
+let mcpCalls; // tools/call params received by the fake MCP server
+let mcpRequests; // every request to the fake MCP server: { body, headers }
+let mcpSse; // answer MCP requests as an event stream instead of JSON
+let mcpDown; // fake MCP server answers 500
+
+const MCP_TOOLS = [
+  { name: "list_issues", description: "List issues.", inputSchema: { type: "object", properties: { repo: { type: "string" } } }, annotations: { readOnlyHint: true } },
+  { name: "create_issue", description: "Create an issue.", inputSchema: { type: "object", properties: { title: { type: "string" } } } },
+];
+const JUDGE0_LANGS = [
+  { id: 70, name: "Python (2.7.17)" }, { id: 71, name: "Python (3.8.1)" }, { id: 109, name: "Python (3.14.0)" },
+  { id: 89, name: "Python for ML (3.11.2)" }, { id: 63, name: "JavaScript (Node.js 12.14.0)" },
+];
 
 const kv = () => {
   const m = new Map();
@@ -46,10 +61,55 @@ beforeEach(() => {
   llmQueue = [];
   failHosts = {};
   rejectTools = false;
+  tgFiles = new Map();
+  transcript = "kal subah 8 baje yaad dilana";
+  mcpCalls = [];
+  mcpRequests = [];
+  mcpSse = false;
+  mcpDown = false;
   globalThis.fetch = async (url, init) => {
-    const body = init?.body ? JSON.parse(init.body) : null;
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : (init?.body ?? null); // FormData stays as is
     calls.push({ url, body, headers: init?.headers });
     const host = new URL(url).host;
+
+    if (url.endsWith("/getFile")) {
+      const f = tgFiles.get(body.file_id) ?? { bytes: new Uint8Array([1, 2, 3]) };
+      return Response.json({ ok: true, result: { file_path: `files/${body.file_id}`, file_size: f.size ?? f.bytes.length } });
+    }
+    if (url.includes("/file/bot")) {
+      const id = url.split("/files/")[1];
+      return new Response((tgFiles.get(id) ?? { bytes: new Uint8Array([1, 2, 3]) }).bytes);
+    }
+    if (url === "https://api.groq.com/openai/v1/audio/transcriptions") {
+      return failHosts[`${host}/stt`] ? new Response("no", { status: 500 }) : Response.json({ text: transcript });
+    }
+    if (url === "https://api.tavily.com/search") {
+      return Response.json({ answer: "It is sunny.", results: [{ title: "Weather", url: "https://w.test/pune", content: "Pune 30C" }] });
+    }
+    if (url.startsWith("https://api.search.brave.com/")) {
+      return Response.json({ web: { results: [{ title: "Brave hit", url: "https://b.test/1", description: "from brave" }] } });
+    }
+    if (url === "https://ce.judge0.com/languages") return Response.json(JUDGE0_LANGS);
+    if (url.startsWith("https://ce.judge0.com/submissions")) {
+      return Response.json({ status: { description: "Accepted" }, stdout: "42\n", stderr: null });
+    }
+    if (url === "https://mcp.test/rpc") {
+      mcpRequests.push({ body, headers: init.headers });
+      if (mcpDown) return new Response("down", { status: 500 });
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      let result = {};
+      if (body.method === "initialize") result = { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "fake", version: "1" } };
+      if (body.method === "tools/list") result = { tools: MCP_TOOLS };
+      if (body.method === "tools/call") {
+        mcpCalls.push(body.params);
+        result = { content: [{ type: "text", text: `ran ${body.params.name} ${JSON.stringify(body.params.arguments)}` }] };
+      }
+      const payload = JSON.stringify({ jsonrpc: "2.0", id: body.id, result });
+      return mcpSse
+        ? new Response(`event: message\ndata: ${payload}\n\n`, { headers: { "content-type": "text/event-stream", "mcp-session-id": "sess1" } })
+        : new Response(payload, { headers: { "content-type": "application/json", "mcp-session-id": "sess1" } });
+    }
+
     if (url.endsWith("/chat/completions")) {
       if (failHosts[host] === "throw") throw new Error("network down");
       if (failHosts[host]) return new Response("nope", { status: failHosts[host] });
@@ -120,7 +180,7 @@ test("reasoning models' <think> blocks are not shown", async () => {
 test("works without a KV binding (stateless, memory tools hidden)", async () => {
   await handleUpdate(msg("hi"), makeEnv({ CHAT: undefined }));
   assert.deepEqual(sent(), ["hello from llm"]);
-  assert.deepEqual(toolNames(llmCalls()[0]), ["fetch_url"]);
+  assert.deepEqual(toolNames(llmCalls()[0]), ["fetch_url", "web_search", "run_code", "send_file"]); // no memory tools, no image tool
 });
 
 // ---- many models: picking, listing, fallback ------------------------------------------------
@@ -271,7 +331,7 @@ test("set_reminder -> due task runs the agent and messages the user first", asyn
   const run = llmCalls().at(-1);
   assert.match(run.body.messages.at(-1).content, /^\[Scheduled task\] Remind me to drink water/);
   // background runs are read-only: no writing memory, no scheduling, no cancelling
-  assert.deepEqual(toolNames(run), ["list_reminders", "fetch_url"]);
+  assert.deepEqual(toolNames(run), ["list_reminders", "fetch_url", "web_search", "run_code"]);
   assert.deepEqual(JSON.parse(env.CHAT.m.get("reminders")), []);
 });
 
@@ -356,4 +416,276 @@ test("webhook fails closed when no secret is configured", async () => {
   const env = makeEnv({ TELEGRAM_WEBHOOK_SECRET: undefined });
   const res = await worker.fetch(new Request("https://w.test/webhook", { method: "POST", body: "{}" }), env, { waitUntil() {} });
   assert.equal(res.status, 403);
+});
+
+// ======================================================================================
+// Beyond text: search, code, files, voice, photos, documents, MCP apps and approvals
+// ======================================================================================
+
+const toolMsg = (n = -1) => llmCalls().at(n).body.messages.at(-1).content; // last message sent to the model on call n
+const MCP = JSON.stringify([{ name: "gh", url: "https://mcp.test/rpc", headers: { Authorization: "Bearer t0k" } }]);
+const callbackUpdate = (data, userId = 42) => ({
+  callback_query: { id: "cb1", from: { id: userId }, data, message: { message_id: 7, chat: { id: 42 } } },
+});
+const callbackIdFromButtons = () => {
+  const withButtons = calls.filter((c) => c.url.endsWith("/sendMessage") && c.body.reply_markup).at(-1);
+  return withButtons.body.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
+};
+
+// ---- web search -----------------------------------------------------------------------------
+
+test("web_search works keyless, with a Tavily key, or with only a Brave key", async () => {
+  llmQueue = [toolCall("web_search", { query: "pune weather" }), { role: "assistant", content: "ok" }];
+  await handleUpdate(msg("weather?"), makeEnv());
+  let req = calls.find((c) => c.url === "https://api.tavily.com/search");
+  assert.equal(req.headers["x-tavily-access-mode"], "keyless");
+  assert.equal(req.headers.authorization, undefined);
+  assert.match(toolMsg(1), /Answer: It is sunny\.[\s\S]*https:\/\/w\.test\/pune/);
+
+  calls = [];
+  llmQueue = [toolCall("web_search", { query: "x" }), { role: "assistant", content: "ok" }];
+  await handleUpdate(msg("again"), makeEnv({ TAVILY_API_KEY: "tvly-1" }));
+  req = calls.find((c) => c.url === "https://api.tavily.com/search");
+  assert.equal(req.headers.authorization, "Bearer tvly-1");
+
+  calls = [];
+  llmQueue = [toolCall("web_search", { query: "x" }), { role: "assistant", content: "ok" }];
+  await handleUpdate(msg("again"), makeEnv({ BRAVE_API_KEY: "br-1" }));
+  req = calls.find((c) => c.url.startsWith("https://api.search.brave.com/"));
+  assert.equal(req.headers["x-subscription-token"], "br-1");
+  assert.match(toolMsg(1), /Brave hit/);
+});
+
+// ---- running code ---------------------------------------------------------------------------
+
+test("run_code picks the newest runtime for the language and returns the output", async () => {
+  llmQueue = [toolCall("run_code", { language: "python", code: "print(6*7)" }), { role: "assistant", content: "42" }];
+  await handleUpdate(msg("6*7?"), makeEnv());
+  const submit = calls.find((c) => c.url.startsWith("https://ce.judge0.com/submissions"));
+  assert.equal(submit.body.language_id, 109); // not 70/71 (old) and not "Python for ML"
+  assert.equal(submit.body.source_code, "print(6*7)");
+  assert.match(toolMsg(1), /Status: Accepted\nstdout:\n42/);
+});
+
+test("run_code rejects unknown languages", async () => {
+  llmQueue = [toolCall("run_code", { language: "cobol", code: "x" }), { role: "assistant", content: "no" }];
+  await handleUpdate(msg("run"), makeEnv());
+  assert.match(toolMsg(1), /language must be one of/);
+});
+
+// ---- making files and images ----------------------------------------------------------------
+
+test("send_file uploads a sanitized document to the chat", async () => {
+  llmQueue = [toolCall("send_file", { filename: "my report/../x.csv", content: "a,b\n1,2" }), { role: "assistant", content: "sent" }];
+  await handleUpdate(msg("csv bana"), makeEnv());
+  const up = calls.find((c) => c.url.endsWith("/sendDocument"));
+  assert.equal(up.body.get("chat_id"), "42");
+  const file = up.body.get("document");
+  assert.equal(file.name, "my report_.._x.csv");
+  assert.equal(await file.text(), "a,b\n1,2");
+});
+
+test("generate_image needs the AI binding, then sends the picture", async () => {
+  const ai = { run: async (model, input) => ({ image: btoa("fakejpeg"), model, input }) };
+  llmQueue = [toolCall("generate_image", { prompt: "a red fox" }), { role: "assistant", content: "done" }];
+  await handleUpdate(msg("fox ki photo bana"), makeEnv({ AI: ai }));
+  const up = calls.find((c) => c.url.endsWith("/sendPhoto"));
+  assert.equal(up.body.get("caption"), "a red fox");
+  assert.equal(await up.body.get("photo").text(), "fakejpeg");
+  assert.match(toolMsg(1), /Image sent/);
+});
+
+// ---- voice, photos, documents the user sends ------------------------------------------------
+
+test("a voice note is transcribed, echoed back, and answered like text", async () => {
+  await handleUpdate({ message: { voice: { file_id: "v1" }, chat: { id: 42 }, from: { id: 42 } } }, makeEnv());
+  assert.equal(sent()[0], "🎤 kal subah 8 baje yaad dilana");
+  assert.equal(llmCalls()[0].body.messages.at(-1).content, "kal subah 8 baje yaad dilana");
+  const stt = calls.find((c) => c.url.endsWith("/audio/transcriptions"));
+  assert.equal(stt.body.get("model"), "whisper-large-v3-turbo");
+  assert.equal(stt.headers.authorization, "Bearer groq-key");
+});
+
+test("voice falls back to Workers AI when Groq fails; with neither, the user is told what to set", async () => {
+  const ai = { run: async () => ({ text: "from workers ai" }) };
+  failHosts["api.groq.com/stt"] = true;
+  await handleUpdate({ message: { voice: { file_id: "v1" }, chat: { id: 42 }, from: { id: 42 } } }, makeEnv({ AI: ai }));
+  assert.equal(sent()[0], "🎤 from workers ai");
+
+  calls = [];
+  await handleUpdate({ message: { voice: { file_id: "v1" }, chat: { id: 42 }, from: { id: 42 } } }, makeEnv({ GROQ_API_KEY: undefined }));
+  assert.match(sent().at(-1), /GROQ_API_KEY/);
+  assert.equal(llmCalls().length, 0);
+});
+
+test("a photo goes to a vision model as an image, and history keeps only a text stand-in", async () => {
+  const env = makeEnv();
+  const update = { message: { photo: [{ file_id: "small" }, { file_id: "big" }], caption: "ye kya hai", chat: { id: 42 }, from: { id: 42 } } };
+  await handleUpdate(update, env);
+
+  const call = llmCalls()[0];
+  assert.equal(call.body.model, "meta/llama-3.2-90b-vision-instruct"); // only NVIDIA has a vision model here
+  const content = call.body.messages.at(-1).content;
+  assert.equal(content[0].text, "ye kya hai");
+  assert.equal(content[1].image_url.url, "data:image/jpeg;base64,AQID"); // bytes 1,2,3
+  assert.ok(calls.some((c) => c.url.endsWith("/getFile") && c.body.file_id === "big")); // the largest size
+  assert.equal(JSON.parse(env.CHAT.m.get("history:42"))[0].content, "[photo] ye kya hai");
+});
+
+test("a photo with no vision-capable key explains what to set", async () => {
+  const update = { message: { photo: [{ file_id: "p" }], chat: { id: 42 }, from: { id: 42 } } };
+  await handleUpdate(update, makeEnv({ NVIDIA_API_KEY: undefined }));
+  assert.match(sent().at(-1), /GEMINI_API_KEY/);
+});
+
+test("a text document is read directly; PDFs go through Workers AI toMarkdown", async () => {
+  tgFiles.set("d1", { bytes: new TextEncoder().encode("hello file") });
+  const textDoc = { document: { file_id: "d1", file_name: "notes.txt", mime_type: "text/plain" }, caption: "summary de", chat: { id: 42 }, from: { id: 42 } };
+  await handleUpdate({ message: textDoc }, makeEnv());
+  assert.equal(llmCalls()[0].body.messages.at(-1).content, "summary de\n\n[File: notes.txt]\nhello file");
+
+  const pdf = { document: { file_id: "d2", file_name: "cv.pdf", mime_type: "application/pdf" }, chat: { id: 42 }, from: { id: 42 } };
+  const ai = { toMarkdown: async ([f]) => [{ name: f.name, format: "markdown", data: "# Resume" }] };
+  await handleUpdate({ message: pdf }, makeEnv({ AI: ai }));
+  assert.match(llmCalls().at(-1).body.messages.at(-1).content, /\[File: cv\.pdf\]\n# Resume/);
+
+  await handleUpdate({ message: pdf }, makeEnv()); // no AI binding
+  assert.match(sent().at(-1), /\[ai\] binding/);
+});
+
+test("oversized files are refused before downloading", async () => {
+  tgFiles.set("huge", { bytes: new Uint8Array(1), size: 50_000_000 });
+  await handleUpdate({ message: { document: { file_id: "huge", file_name: "a.txt", mime_type: "text/plain" }, chat: { id: 42 }, from: { id: 42 } } }, makeEnv());
+  assert.match(sent().at(-1), /bahut badi/);
+  assert.equal(calls.filter((c) => c.url.includes("/file/bot")).length, 0);
+});
+
+test("media from users who are not allowed is never downloaded", async () => {
+  await handleUpdate({ message: { voice: { file_id: "v1" }, chat: { id: 7 }, from: { id: 7 } } }, makeEnv());
+  assert.equal(calls.length, 0);
+});
+
+test("fetch_url asks a reader service to render JavaScript pages, unless disabled", async () => {
+  globalThis.fetch = ((orig) => async (url, init) => {
+    if (url === "https://spa.test/app") return new Response("<html><div id=root></div></html>", { headers: { "content-type": "text/html" } });
+    if (url === "https://r.jina.ai/https://spa.test/app") return new Response("Rendered article text ".repeat(20));
+    return orig(url, init);
+  })(globalThis.fetch);
+
+  llmQueue = [toolCall("fetch_url", { url: "https://spa.test/app" }), { role: "assistant", content: "ok" }];
+  await handleUpdate(msg("read"), makeEnv());
+  assert.match(toolMsg(1), /Rendered article text/);
+
+  calls = [];
+  llmQueue = [toolCall("fetch_url", { url: "https://spa.test/app" }), { role: "assistant", content: "ok" }];
+  await handleUpdate(msg("read"), makeEnv({ JINA_FALLBACK: "0" }));
+  assert.equal(calls.filter((c) => c.url.startsWith("https://r.jina.ai")).length, 0);
+});
+
+// ---- MCP apps and approvals -----------------------------------------------------------------
+
+test("MCP tools are discovered, cached, and read-only ones run without asking", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  llmQueue = [toolCall("gh__list_issues", { repo: "me/app" }), { role: "assistant", content: "2 issues" }];
+  await handleUpdate(msg("issues dikha"), env);
+
+  assert.deepEqual(toolNames(llmCalls()[0]).filter((n) => n.startsWith("gh__")), ["gh__create_issue", "gh__list_issues"]);
+  assert.deepEqual(mcpCalls, [{ name: "list_issues", arguments: { repo: "me/app" } }]);
+  assert.match(toolMsg(1), /ran list_issues/);
+  const methods = mcpRequests.map((r) => r.body.method);
+  assert.deepEqual(methods.slice(0, 3), ["initialize", "notifications/initialized", "tools/list"]);
+  assert.equal(mcpRequests[0].headers.Authorization, "Bearer t0k");
+  assert.equal(mcpRequests.find((r) => r.body.method === "tools/call").headers["mcp-session-id"], "sess1");
+
+  await handleUpdate(msg("phir se"), env);
+  assert.equal(mcpRequests.filter((r) => r.body.method === "tools/list").length, 1); // second message used the cache
+});
+
+test("MCP servers that answer with an event stream work too", async () => {
+  mcpSse = true;
+  llmQueue = [toolCall("gh__list_issues", {}), { role: "assistant", content: "ok" }];
+  await handleUpdate(msg("issues"), makeEnv({ MCP_SERVERS: MCP }));
+  assert.match(toolMsg(1), /ran list_issues/);
+});
+
+test("an MCP server that is down doesn't break the bot", async () => {
+  mcpDown = true;
+  await handleUpdate(msg("hi"), makeEnv({ MCP_SERVERS: MCP }));
+  assert.deepEqual(sent(), ["hello from llm"]);
+  assert.equal(toolNames(llmCalls()[0]).some((n) => n.startsWith("gh__")), false);
+});
+
+test("risky MCP calls wait for a button tap; Approve runs them exactly once", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  llmQueue = [toolCall("gh__create_issue", { title: "bug" }), { role: "assistant", content: "Approval ka wait hai" }];
+  await handleUpdate(msg("issue bana"), env);
+
+  assert.deepEqual(mcpCalls, []); // nothing ran yet
+  const ask = calls.find((c) => c.url.endsWith("/sendMessage") && c.body.reply_markup);
+  assert.match(ask.body.text, /Approval chahiye\nAction: gh__create_issue[\s\S]*"title": "bug"/);
+  assert.match(toolMsg(1), /NOT executed yet/);
+  assert.equal(sent().at(-1), "Approval ka wait hai");
+
+  const id = callbackIdFromButtons();
+  await handleUpdate(callbackUpdate(`ok:${id}`), env);
+  assert.deepEqual(mcpCalls, [{ name: "create_issue", arguments: { title: "bug" } }]);
+  assert.match(sent().at(-1), /✅ Ho gaya \(gh__create_issue\)[\s\S]*ran create_issue/);
+  assert.ok(calls.some((c) => c.url.endsWith("/editMessageReplyMarkup"))); // buttons removed
+  assert.match(JSON.parse(env.CHAT.m.get("history:42")).at(-1).content, /approved and gh__create_issue ran/);
+
+  await handleUpdate(callbackUpdate(`ok:${id}`), env); // double tap
+  assert.equal(mcpCalls.length, 1);
+  assert.match(sent().at(-1), /expire/);
+});
+
+test("Reject cancels, and taps from other users do nothing", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  llmQueue = [toolCall("gh__create_issue", { title: "bug" }), { role: "assistant", content: "wait" }];
+  await handleUpdate(msg("issue bana"), env);
+  const id = callbackIdFromButtons();
+
+  const before = calls.length;
+  await handleUpdate(callbackUpdate(`ok:${id}`, 7), env); // stranger
+  assert.equal(calls.length, before);
+  assert.equal(mcpCalls.length, 0);
+
+  await handleUpdate(callbackUpdate(`no:${id}`), env);
+  assert.equal(mcpCalls.length, 0);
+  assert.match(sent().at(-1), /cancel/);
+  assert.match(JSON.parse(env.CHAT.m.get("history:42")).at(-1).content, /rejected gh__create_issue/);
+});
+
+test("AUTO_APPROVE lets chosen tools run without asking", async () => {
+  llmQueue = [toolCall("gh__create_issue", { title: "bug" }), { role: "assistant", content: "done" }];
+  await handleUpdate(msg("issue bana"), makeEnv({ MCP_SERVERS: MCP, AUTO_APPROVE: "gh__create_*" }));
+  assert.deepEqual(mcpCalls, [{ name: "create_issue", arguments: { title: "bug" } }]);
+  assert.equal(calls.some((c) => c.body?.reply_markup), false);
+});
+
+test("background runs only get read-only MCP tools; TOOLS can allow a whole server with a wildcard", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  await env.CHAT.put("reminders", JSON.stringify([{ id: "a", chatId: 42, text: "check issues", due: Date.now() - 1 }]));
+  await runDue(env);
+  assert.deepEqual(toolNames(llmCalls()[0]).filter((n) => n.startsWith("gh__")), ["gh__list_issues"]);
+
+  calls = [];
+  await handleUpdate(msg("hi"), makeEnv({ MCP_SERVERS: MCP, TOOLS: "gh__*" }));
+  assert.deepEqual(toolNames(llmCalls()[0]), ["gh__create_issue", "gh__list_issues"]);
+});
+
+test("/tools lists everything the bot can do and marks the ones that need approval", async () => {
+  await handleUpdate(msg("/tools"), makeEnv({ MCP_SERVERS: MCP }));
+  const text = sent().at(-1);
+  assert.match(text, /• web_search/);
+  assert.match(text, /• gh__list_issues/);
+  assert.match(text, /✋ gh__create_issue/);
+  assert.doesNotMatch(text, /generate_image/); // no AI binding
+});
+
+test("MCP_SERVERS must be https and valid JSON, otherwise it is ignored", async () => {
+  await handleUpdate(msg("hi"), makeEnv({ MCP_SERVERS: JSON.stringify([{ name: "bad", url: "http://insecure.test/rpc" }]) }));
+  await handleUpdate(msg("hi"), makeEnv({ MCP_SERVERS: "{not json" }));
+  assert.equal(calls.some((c) => c.url.includes("insecure.test")), false); // never contacted over plain http
+  assert.equal(mcpRequests.length, 0);
+  assert.deepEqual(sent(), ["hello from llm", "hello from llm"]);
 });

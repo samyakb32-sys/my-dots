@@ -18,7 +18,13 @@ export const PRESETS = {
   llama: "nvidia:meta/llama-3.3-70b-instruct",
   nemotron: "nvidia:nvidia/nemotron-3-ultra-550b-a55b",
   free: "openrouter:openrouter/free", // OpenRouter picks any currently-free model
+  // Vision-capable (photos). "-latest" is Google's own alias, so it survives model renames.
+  gemini: "gemini:gemini-flash-latest",
+  "llama-vision": "nvidia:meta/llama-3.2-90b-vision-instruct",
 };
+
+// Tried for messages that contain a photo (override with the VISION_CHAIN var).
+export const DEFAULT_VISION_CHAIN = "gemini,llama-vision";
 
 const TRY_MS = 20_000; // per model; slow free endpoints shouldn't eat the whole time budget
 
@@ -33,10 +39,10 @@ export function resolveModel(spec) {
 
 export const hasKey = (env, provider) => Boolean(env[PROVIDERS[provider].keyEnv]);
 
-/** Models to try, in order: the chat's pick first, then MODEL_CHAIN. Providers without a key are dropped. */
-export function modelChain(env, selected) {
+/** Models to try, in order: the chat's pick first, then `chainSpec` (MODEL_CHAIN). Providers without a key are dropped. */
+export function modelChain(env, selected, chainSpec = env.MODEL_CHAIN) {
   const seen = new Set();
-  return [selected, ...(env.MODEL_CHAIN || "").split(",")]
+  return [selected, ...(chainSpec || "").split(",")]
     .map((s) => s?.trim())
     .filter(Boolean)
     .map(resolveModel)
