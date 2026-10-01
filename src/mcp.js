@@ -36,24 +36,42 @@ function parseSse(text, id) {
   throw new Error("no response in event stream");
 }
 
+// A call that failed after it may have reached the server: the action might have happened. approvals.js
+// reports this to the user as "outcome unknown" instead of "failed", and nothing retries it.
+const unsure = (message) => Object.assign(new Error(message), { outcomeUnknown: true });
+
 async function post(server, body, session) {
-  const res = await fetch(server.url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json, text/event-stream",
-      ...(server.headers || {}),
-      ...(session.id ? { "mcp-session-id": session.id, "mcp-protocol-version": PROTOCOL } : {}),
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(20_000),
-  });
-  if (!res.ok) throw new Error(`${server.name}: HTTP ${res.status}`);
+  let res;
+  try {
+    res = await fetch(server.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...(server.headers || {}),
+        ...(session.id ? { "mcp-session-id": session.id, "mcp-protocol-version": PROTOCOL } : {}),
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch (e) {
+    throw unsure(`${server.name}: ${e.message}`); // network error or timeout: the request may have been processed
+  }
+  if (!res.ok) {
+    const error = new Error(`${server.name}: HTTP ${res.status}`);
+    if (res.status >= 500) error.outcomeUnknown = true;
+    throw error;
+  }
   session.id = res.headers.get("mcp-session-id") || session.id;
   if (body.id === undefined) return null; // notification: nothing to read
-  const text = await res.text();
-  const reply = (res.headers.get("content-type") || "").includes("text/event-stream") ? parseSse(text, body.id) : JSON.parse(text);
-  if (reply.error) throw new Error(`${server.name}: ${reply.error.message}`);
+  let reply;
+  try {
+    const text = await res.text();
+    reply = (res.headers.get("content-type") || "").includes("text/event-stream") ? parseSse(text, body.id) : JSON.parse(text);
+  } catch (e) {
+    throw unsure(`${server.name}: unreadable response (${e.message})`);
+  }
+  if (reply.error) throw new Error(`${server.name}: ${reply.error.message}`); // the server answered and refused
   return reply.result;
 }
 
@@ -99,7 +117,13 @@ async function listTools(env, server) {
 }
 
 async function callTool(server, name, args) {
-  const session = await connect(server);
+  let session;
+  try {
+    session = await connect(server);
+  } catch (e) {
+    e.outcomeUnknown = false; // nothing was sent yet: the tool did not run
+    throw e;
+  }
   const result = await post(server, { jsonrpc: "2.0", id: 99, method: "tools/call", params: { name, arguments: args } }, session);
   const text = (result.content || []).map((c) => (c.type === "text" ? c.text : `[${c.type}]`)).join("\n");
   return `${result.isError ? "Error: " : ""}${text}`.slice(0, RESULT_CHARS) || "(empty result)";

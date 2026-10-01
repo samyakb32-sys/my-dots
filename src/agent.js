@@ -3,6 +3,9 @@
 import { complete, modelChain, DEFAULT_VISION_CHAIN } from "./models.js";
 import { EXTRA_TOOLS } from "./tools-extra.js";
 import { loadMcpTools, refreshMcp } from "./mcp.js";
+import { WATCH_TOOLS } from "./watch.js";
+import { BROWSER_TOOLS } from "./browser.js";
+import { readPage } from "./page.js";
 import { requestApproval } from "./approvals.js";
 import { csv, matchesAny, obj, str, num } from "./util.js";
 
@@ -15,13 +18,12 @@ const MAX_FACTS = 50;
 const MAX_TASKS = 20;
 const MIN_REPEAT_MINUTES = 10; // keeps recurring tasks from burning the free LLM quota
 const PAGE_CHARS = 6000;
-const MAX_PAGE_BYTES = 2_000_000;
 
 const DEFAULT_PROMPT =
   "You are the user's personal always-on assistant, chatting on Telegram. " +
   "Reply in the language the user writes in (Hinglish is fine). Keep answers short and plain text. " +
   "Use tools when they help: search the web, read pages, run code, make files or images, remember lasting " +
-  "preferences, schedule reminders or recurring tasks. Never invent facts you could look up. " +
+  "preferences, schedule reminders or recurring tasks, watch a page for changes or price drops. Never invent facts you could look up. " +
   "Some actions need the user's approval: call the tool to request it, and never claim it is done before they approve.";
 
 // ---- storage (Cloudflare KV, optional) ------------------------------------------------------
@@ -139,30 +141,12 @@ const TOOLS = {
     description: "Fetch a web page (http/https) and return its text. Use to read articles, docs, feeds.",
     parameters: obj({ url: str("Full URL") }, ["url"]),
     async run(env, _ctx, { url }) {
-      if (!/^https?:\/\//i.test(String(url))) return "Error: only http(s) URLs.";
-      const res = await fetch(url, { signal: AbortSignal.timeout(10_000), headers: { "user-agent": "telegram-ai-bot" } });
-      if (Number(res.headers.get("content-length")) > MAX_PAGE_BYTES) return "Error: page too large.";
-      let text = await res.text();
-      const isHtml = (res.headers.get("content-type") || "").includes("html");
-      if (isHtml) {
-        text = text
-          .replace(/<(script|style|noscript)[\s\S]*?<\/\1>/gi, " ")
-          .replace(/<[^>]+>/g, " ")
-          .replace(/&nbsp;/g, " ")
-          .replace(/&amp;/g, "&");
-      }
-      let clean = text.replace(/\s+/g, " ").trim();
-      if (isHtml && clean.length < 200 && env.JINA_FALLBACK !== "0") {
-        // Almost no text usually means a JavaScript-rendered page: let a reader service render it for us.
-        const r = await fetch(`https://r.jina.ai/${url}`, { signal: AbortSignal.timeout(15_000) }).catch(() => null);
-        const rendered = r?.ok ? (await r.text()).replace(/\s+/g, " ").trim() : "";
-        if (rendered.length > clean.length) clean = rendered;
-      }
-      return `HTTP ${res.status}\n${clean.slice(0, PAGE_CHARS)}`;
+      const { status, text } = await readPage(env, url);
+      return `HTTP ${status}\n${text.slice(0, PAGE_CHARS)}`;
     },
   },
 };
-Object.assign(TOOLS, EXTRA_TOOLS);
+Object.assign(TOOLS, EXTRA_TOOLS, WATCH_TOOLS, BROWSER_TOOLS);
 
 // Boundaries: the TOOLS env var (comma list, trailing * allowed) limits what the agent may do. Scheduled
 // (background) runs are read-only, like dots' autonomous mode: they can look things up but change nothing.
@@ -196,14 +180,18 @@ async function runTool(env, tools, call, ctx) {
   }
 }
 
-/** Run a call the user just approved with the buttons. */
+/**
+ * Run a call the user just approved with the buttons. The outcome is "succeeded", "failed" (it did not happen) or
+ * "outcome_unknown" (the request may have reached the provider; never retry it blindly).
+ */
 export async function executePending(env, { chatId, name, args }) {
   const tool = (await enabledTools(env, false)).find(([n]) => n === name)?.[1];
-  if (!tool) return "Error: ye tool ab available nahi hai.";
+  if (!tool) return { status: "failed", text: "Error: ye tool ab available nahi hai." };
   try {
-    return String(await tool.run(env, { chatId }, args));
+    const text = String(await tool.run(env, { chatId }, args));
+    return { status: text.startsWith("Error:") ? "failed" : "succeeded", text };
   } catch (e) {
-    return `Error: ${e.message}`;
+    return { status: e.outcomeUnknown ? "outcome_unknown" : "failed", text: `Error: ${e.message}` };
   }
 }
 

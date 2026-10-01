@@ -9,8 +9,11 @@ import {
 } from "./models.js";
 import { tg, sendMessage } from "./telegram.js";
 import { prepareInput } from "./media.js";
-import { takePending } from "./approvals.js";
+import { claimApproval, finishApproval } from "./approvals.js";
+import { checkWatches } from "./watch.js";
 import { csv } from "./util.js";
+
+export { ApprovalLock } from "./approval-lock.js"; // Durable Object class, bound as APPROVAL_LOCK in wrangler.toml
 
 const isAllowed = (env, userId) => csv(env.ALLOWED_USER_IDS).includes(String(userId));
 
@@ -30,9 +33,10 @@ export default {
     return new Response("ok");
   },
 
-  // Cron trigger (every minute): the bot messages you first when a scheduled task is due.
+  // Cron trigger (every minute): the bot messages you first when a scheduled task is due or a watched page matched.
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(runDue(env).catch((e) => console.error(e)));
+    ctx.waitUntil(checkWatches(env).catch((e) => console.error(e)));
   },
 };
 
@@ -40,23 +44,52 @@ export default {
 async function handleCallback(cb, env) {
   if (!isAllowed(env, cb.from.id)) return;
   const chatId = cb.message?.chat?.id;
-  const [action, id] = (cb.data || "").split(":");
+  const [action, id, hash] = (cb.data || "").split(":");
+  if (action !== "ok" && action !== "no") return;
   await tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
-  // Remove the buttons right away so it can't be tapped twice.
+  let claim;
+  try {
+    claim = await claimApproval(env, { id, hash, chatId, decision: action === "ok" ? "approve" : "deny" });
+  } catch (e) {
+    console.error(e); // the decision wasn't recorded: leave the buttons so it can be tapped again
+    return sendMessage(env, chatId, "Abhi approval record nahi ho paya. Buttons wahi hain, thodi der baad dobara dabake dekh.");
+  }
+  // Decided or refused: either way these buttons are finished.
   await tg(env, "editMessageReplyMarkup", {
     chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] },
   });
-  const pending = await takePending(env, id);
-  if (!pending || pending.chatId !== chatId) {
+  if (claim.status === "changed") {
+    return sendMessage(env, chatId, "Ye request badal gayi thi ya purani hai, isliye nahi chalayi. Dobara bol.");
+  }
+  if (claim.status !== "claimed") {
     return sendMessage(env, chatId, "Ye request expire ho gayi ya pehle hi ho chuki hai.");
   }
+  const { pending } = claim;
   if (action !== "ok") {
     await addHistoryNote(env, chatId, `[The user rejected ${pending.name}; it was not run.]`);
     return sendMessage(env, chatId, "Theek hai, cancel kar diya.");
   }
-  const result = await executePending(env, pending);
-  await addHistoryNote(env, chatId, `[The user approved and ${pending.name} ran. Result: ${result.slice(0, 500)}]`);
-  return sendMessage(env, chatId, `✅ Ho gaya (${pending.name}):\n${result.slice(0, 1500)}`);
+  const outcome = await executePending(env, pending);
+  // The action already ran: a failure to record it must never hide the result from the user.
+  await finishApproval(env, id, pending, outcome).catch((e) => console.error(e));
+  const { status, text } = outcome;
+  if (status === "succeeded") {
+    await addHistoryNote(env, chatId, `[The user approved and ${pending.name} ran. Result: ${text.slice(0, 500)}]`);
+    return sendMessage(env, chatId, `✅ Ho gaya (${pending.name}):\n${text.slice(0, 1500)}`);
+  }
+  if (status === "outcome_unknown") {
+    await addHistoryNote(
+      env, chatId,
+      `[The user approved ${pending.name} but its outcome is unknown (${text.slice(0, 300)}). It may or may not have happened. Never retry it; ask the user to check first.]`,
+    );
+    return sendMessage(
+      env, chatId,
+      `⚠️ Pata nahi chala (${pending.name}): request bheji gayi thi par jawab nahi mila, to ho sakta hai ho gaya ho. ` +
+        `Dobara mat chala, pehle app mein check kar.\n${text.slice(0, 1000)}`,
+    );
+  }
+  await addHistoryNote(env, chatId, `[The user approved ${pending.name} but it failed and did not run: ${text.slice(0, 500)}]`);
+  return sendMessage(env, chatId, `❌ Fail ho gaya (${pending.name}):\n${text.slice(0, 1500)}`);
 }
 
 export async function handleUpdate(update, env) {

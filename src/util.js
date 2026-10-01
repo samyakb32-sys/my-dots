@@ -11,6 +11,12 @@ export function toBase64(bytes) {
 
 export const fromBase64 = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
+/** SHA-256 as hex (Web Crypto: available in Workers and Node). */
+export async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** "a,b,c*" style allowlist match: exact name or a trailing-* prefix. */
 export const matchesAny = (list, name) =>
   list.some((p) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : p === name));

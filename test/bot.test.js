@@ -2,6 +2,7 @@ import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import worker, { handleUpdate, runDue } from "../src/index.js";
 import { complete, modelChain } from "../src/models.js";
+import { ApprovalLock } from "../src/approval-lock.js";
 
 const GROQ = "api.groq.com";
 const NVIDIA = "integrate.api.nvidia.com";
@@ -17,6 +18,8 @@ let mcpCalls; // tools/call params received by the fake MCP server
 let mcpRequests; // every request to the fake MCP server: { body, headers }
 let mcpSse; // answer MCP requests as an event stream instead of JSON
 let mcpDown; // fake MCP server answers 500
+let mcpCallFail; // tools/call fails: "throw" (network), an HTTP status, or "iserror" (the tool reports an error)
+let tgFail; // (url, body) => true makes that Telegram call answer 400
 
 const MCP_TOOLS = [
   { name: "list_issues", description: "List issues.", inputSchema: { type: "object", properties: { repo: { type: "string" } } }, annotations: { readOnlyHint: true } },
@@ -67,10 +70,13 @@ beforeEach(() => {
   mcpRequests = [];
   mcpSse = false;
   mcpDown = false;
+  mcpCallFail = null;
+  tgFail = null;
   globalThis.fetch = async (url, init) => {
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : (init?.body ?? null); // FormData stays as is
     calls.push({ url, body, headers: init?.headers });
     const host = new URL(url).host;
+    if (tgFail?.(url, body)) return new Response("{}", { status: 400 });
 
     if (url.endsWith("/getFile")) {
       const f = tgFiles.get(body.file_id) ?? { bytes: new Uint8Array([1, 2, 3]) };
@@ -101,8 +107,11 @@ beforeEach(() => {
       if (body.method === "initialize") result = { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "fake", version: "1" } };
       if (body.method === "tools/list") result = { tools: MCP_TOOLS };
       if (body.method === "tools/call") {
-        mcpCalls.push(body.params);
-        result = { content: [{ type: "text", text: `ran ${body.params.name} ${JSON.stringify(body.params.arguments)}` }] };
+        if (mcpCallFail === "throw") throw new Error("socket hang up");
+        if (typeof mcpCallFail === "number") return new Response("rejected", { status: mcpCallFail });
+        if (mcpCallFail === "iserror") result = { isError: true, content: [{ type: "text", text: "permission denied" }] };
+        else mcpCalls.push(body.params);
+        if (mcpCallFail !== "iserror") result = { content: [{ type: "text", text: `ran ${body.params.name} ${JSON.stringify(body.params.arguments)}` }] };
       }
       const payload = JSON.stringify({ jsonrpc: "2.0", id: body.id, result });
       return mcpSse
@@ -331,7 +340,7 @@ test("set_reminder -> due task runs the agent and messages the user first", asyn
   const run = llmCalls().at(-1);
   assert.match(run.body.messages.at(-1).content, /^\[Scheduled task\] Remind me to drink water/);
   // background runs are read-only: no writing memory, no scheduling, no cancelling
-  assert.deepEqual(toolNames(run), ["list_reminders", "fetch_url", "web_search", "run_code"]);
+  assert.deepEqual(toolNames(run), ["list_reminders", "fetch_url", "web_search", "run_code", "list_watches"]);
   assert.deepEqual(JSON.parse(env.CHAT.m.get("reminders")), []);
 });
 
@@ -429,7 +438,7 @@ const callbackUpdate = (data, userId = 42) => ({
 });
 const callbackIdFromButtons = () => {
   const withButtons = calls.filter((c) => c.url.endsWith("/sendMessage") && c.body.reply_markup).at(-1);
-  return withButtons.body.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
+  return withButtons.body.reply_markup.inline_keyboard[0][0].callback_data.slice(3); // "<id>:<hash>", what follows "ok:"
 };
 
 // ---- web search -----------------------------------------------------------------------------
@@ -688,4 +697,180 @@ test("MCP_SERVERS must be https and valid JSON, otherwise it is ignored", async 
   assert.equal(calls.some((c) => c.url.includes("insecure.test")), false); // never contacted over plain http
   assert.equal(mcpRequests.length, 0);
   assert.deepEqual(sent(), ["hello from llm", "hello from llm"]);
+});
+
+// ---- approvals: content binding, expiry, concurrency, outcomes ------------------------------
+
+const requestIssue = async (env, args = { title: "bug" }, id = "c1") => {
+  llmQueue = [toolCall("gh__create_issue", args, id), { role: "assistant", content: "wait" }];
+  await handleUpdate(msg("issue bana"), env);
+};
+const pendingKeys = (env) => [...env.CHAT.m.keys()].filter((k) => k.startsWith("pending:"));
+const readPending = (env, payload) => JSON.parse(env.CHAT.m.get(`pending:${payload.split(":")[0]}`));
+const tap = (env, payload, action = "ok") => handleUpdate(callbackUpdate(`${action}:${payload}`), env);
+
+const lockNamespace = () => {
+  const store = new Map();
+  const storage = {
+    get: async (k) => store.get(k),
+    put: async (k, v) => void store.set(k, v),
+    delete: async (k) => void store.delete(k),
+    list: async () => new Map(store),
+  };
+  const lock = new ApprovalLock({ storage });
+  let queue = Promise.resolve(); // a Durable Object handles one request at a time
+  const next = (url, init) => (queue = queue.then(() => lock.fetch(new Request(url, init))));
+  return { idFromName: (n) => n, get: () => ({ fetch: next }), store };
+};
+
+test("approval buttons are bound to the request: no hash, a wrong hash, or an altered request never runs", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  await requestIssue(env);
+  const payload = callbackIdFromButtons();
+  const [id] = payload.split(":");
+
+  await tap(env, id); // button without a hash
+  assert.match(sent().at(-1), /badal gayi/);
+  await tap(env, `${id}:000000000000`); // some other request's hash
+  assert.match(sent().at(-1), /badal gayi/);
+  await tap(env, `${id}:${payload.split(":")[1].slice(0, 1)}`); // a prefix that matches but is too short to mean anything
+  assert.match(sent().at(-1), /badal gayi/);
+
+  const record = readPending(env, payload);
+  record.args.title = "something else"; // the parked call is altered after the user was asked
+  env.CHAT.m.set(`pending:${id}`, JSON.stringify(record));
+  await tap(env, payload);
+  assert.match(sent().at(-1), /badal gayi/);
+  assert.deepEqual(mcpCalls, []);
+});
+
+test("an approval that expired does not run, even if its KV entry is still there", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  await requestIssue(env);
+  const payload = callbackIdFromButtons();
+  const record = readPending(env, payload);
+  env.CHAT.m.set(`pending:${payload.split(":")[0]}`, JSON.stringify({ ...record, expiresAt: Date.now() - 1 }));
+
+  await tap(env, payload);
+  assert.deepEqual(mcpCalls, []);
+  assert.match(sent().at(-1), /expire/);
+});
+
+test("arguments too long for the message are attached in full before the buttons appear", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  const title = "x".repeat(5000);
+  await requestIssue(env, { title });
+
+  const doc = calls.find((c) => c.url.endsWith("/sendDocument"));
+  assert.match(await doc.body.get("document").text(), new RegExp(`"title": "x{5000}"`));
+  const ask = calls.find((c) => c.url.endsWith("/sendMessage") && c.body.reply_markup);
+  assert.ok(calls.indexOf(doc) < calls.indexOf(ask)); // the file comes first
+  assert.ok(ask.body.text.length < 4096);
+  assert.match(ask.body.text, /poora content upar file mein/);
+});
+
+test("if the user can't be asked, nothing stays pending and the model is told", async () => {
+  for (const fails of [(url) => url.endsWith("/sendDocument"), (url, body) => url.endsWith("/sendMessage") && body.reply_markup]) {
+    tgFail = fails;
+    const env = makeEnv({ MCP_SERVERS: MCP });
+    await requestIssue(env, { title: "x".repeat(5000) });
+    assert.match(toolMsg(1), /could not ask the user for approval/);
+    assert.deepEqual([...env.CHAT.m.keys()].filter((k) => k.startsWith("pending")), []);
+    assert.deepEqual(mcpCalls, []);
+  }
+});
+
+test("the model repeating a risky call doesn't stack up identical prompts", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  llmQueue = [toolCall("gh__create_issue", { title: "bug" }, "c1"), toolCall("gh__create_issue", { title: "bug" }, "c2"), { role: "assistant", content: "wait" }];
+  await handleUpdate(msg("issue bana"), env);
+
+  assert.equal(calls.filter((c) => c.url.endsWith("/sendMessage") && c.body.reply_markup).length, 1);
+  assert.match(toolMsg(2), /already waiting/);
+  assert.equal(pendingKeys(env).length, 1);
+
+  // A different call (other arguments) is a different request.
+  llmQueue = [toolCall("gh__create_issue", { title: "another" }), { role: "assistant", content: "wait" }];
+  await handleUpdate(msg("ek aur"), env);
+  assert.equal(pendingKeys(env).length, 2);
+});
+
+test("simultaneous taps run the action once when the Durable Object lock is bound", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP, APPROVAL_LOCK: lockNamespace() });
+  await requestIssue(env);
+  const payload = callbackIdFromButtons();
+
+  await Promise.all([tap(env, payload), tap(env, payload), tap(env, payload, "no")]);
+  assert.equal(mcpCalls.length + (sent().filter((t) => /cancel/.test(t)).length), 1); // one decision in total: run or cancel
+  assert.equal(sent().filter((t) => /expire ho gayi ya pehle hi/.test(t)).length, 2); // the others were told it's done
+  assert.equal(env.APPROVAL_LOCK.store.size, 1);
+});
+
+test("ApprovalLock: the first claim wins, later ones lose, and old claims are forgotten", async () => {
+  const store = new Map([["ancient", { decision: "approve", at: Date.now() - 25 * 3600 * 1000 }]]);
+  const lock = new ApprovalLock({ storage: { get: async (k) => store.get(k), put: async (k, v) => void store.set(k, v), delete: async (k) => void store.delete(k), list: async () => new Map(store) } });
+  const claim = async (id, decision) => (await lock.fetch(new Request("https://lock/claim", { method: "POST", body: JSON.stringify({ id, decision }) }))).json();
+
+  assert.deepEqual(await claim("a1", "approve"), { won: true });
+  assert.deepEqual(await claim("a1", "approve"), { won: false, decision: "approve" });
+  assert.deepEqual(await claim("a1", "deny"), { won: false, decision: "approve" });
+  assert.deepEqual(await claim("b2", "deny"), { won: true });
+  assert.equal(store.has("ancient"), false);
+});
+
+test("a call whose outcome is uncertain is reported as unknown, recorded, and never retried", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  await requestIssue(env);
+  const payload = callbackIdFromButtons();
+  mcpCallFail = "throw"; // the connection drops after the request was sent
+
+  await tap(env, payload);
+  assert.match(sent().at(-1), /⚠️ Pata nahi chala \(gh__create_issue\)[\s\S]*Dobara mat chala/);
+  assert.equal(readPending(env, payload).status, "outcome_unknown");
+  assert.match(JSON.parse(env.CHAT.m.get("history:42")).at(-1).content, /outcome is unknown[\s\S]*Never retry/);
+
+  mcpCallFail = null;
+  await tap(env, payload); // tapping again must not run it
+  assert.equal(mcpRequests.filter((r) => r.body.method === "tools/call").length, 1);
+  assert.deepEqual(mcpCalls, []);
+});
+
+test("a server error (5xx) is unknown too, but an answer that says no is a plain failure", async () => {
+  for (const [fail, status, shown] of [[500, "outcome_unknown", /Pata nahi chala/], [400, "failed", /❌ Fail ho gaya/], ["iserror", "failed", /❌ Fail ho gaya[\s\S]*permission denied/]]) {
+    mcpCallFail = null;
+    const env = makeEnv({ MCP_SERVERS: MCP });
+    await requestIssue(env);
+    const payload = callbackIdFromButtons();
+    mcpCallFail = fail;
+    await tap(env, payload);
+    assert.match(sent().at(-1), shown);
+    assert.equal(readPending(env, payload).status, status);
+    assert.doesNotMatch(sent().at(-1), /✅/);
+  }
+});
+
+test("a successful approval is recorded with its result", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  await requestIssue(env);
+  const payload = callbackIdFromButtons();
+  await tap(env, payload);
+
+  const record = readPending(env, payload);
+  assert.equal(record.status, "succeeded");
+  assert.match(record.result, /ran create_issue/);
+  assert.equal(env.CHAT.m.has(`pending-dup:${record.hash.slice(0, 16)}`), false); // the same call can be asked again later
+});
+
+test("if recording the outcome fails, the user still hears what happened", async () => {
+  const env = makeEnv({ MCP_SERVERS: MCP });
+  await requestIssue(env);
+  const payload = callbackIdFromButtons();
+  const put = env.CHAT.put;
+  env.CHAT.put = async (key, value, opts) => {
+    if (key.startsWith("pending:") && value.includes('"status":"succeeded"')) throw new Error("KV down");
+    return put(key, value, opts);
+  };
+  await tap(env, payload);
+  assert.deepEqual(mcpCalls, [{ name: "create_issue", arguments: { title: "bug" } }]);
+  assert.match(sent().at(-1), /✅ Ho gaya \(gh__create_issue\)/);
 });

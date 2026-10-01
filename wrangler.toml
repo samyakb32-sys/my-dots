@@ -24,11 +24,25 @@ TIMEZONE = "Asia/Kolkata" # used for "kal subah 8 baje"; change to your IANA tim
 # AUTO_APPROVE = ""
 # JUDGE0_URL = "https://ce.judge0.com"   # code runner; point at your own Judge0 for heavier use
 # JINA_FALLBACK = "0"                    # "0" stops fetch_url from using r.jina.ai to render JavaScript pages
+# WATCH_MIN_MINUTES = "30"               # page watcher: minimum minutes between checks (each check is one KV write; floor 10)
+# BROWSER_WORKER_URL = "https://your-tunnel.example.com"  # optional real browser (README "Real browser"); https only.
+#                                        # The matching secret is BROWSER_WORKER_TOKEN.
 
 # Memory + scheduled tasks + approvals. Create with: npx wrangler kv namespace create CHAT  (paste the id below)
 [[kv_namespaces]]
 binding = "CHAT"
 id = "REPLACE_WITH_KV_ID"
+
+# Approval decisions: exactly one tap per approval wins even if buttons are pressed twice at once (KV can't do that).
+# Works on the free plan (SQLite-backed Durable Object); `wrangler deploy` creates it. Delete both blocks to fall back
+# to a best-effort KV claim.
+[[durable_objects.bindings]]
+name = "APPROVAL_LOCK"
+class_name = "ApprovalLock"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ApprovalLock"]
 
 # Secrets (set with `npx wrangler secret put NAME`, never commit them):
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, ALLOWED_USER_IDS
@@ -37,3 +51,4 @@ id = "REPLACE_WITH_KV_ID"
 #   optional:
 #     TAVILY_API_KEY or BRAVE_API_KEY  (web search; Tavily also works without a key)
 #     MCP_SERVERS                      (JSON list of apps: GitHub, Zapier -> Gmail/Calendar..., see README)
+#     BROWSER_WORKER_TOKEN             (bearer token of your browser worker, see README)
