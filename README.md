@@ -240,3 +240,17 @@ If you encounter agent import errors:
 ```bash
 npm run install:agent
 ```
+
+## CopilotKit Intelligence
+
+This app is connected to the CopilotKit Intelligence project **my-dots**
+(recorded in `.copilotkit/project.json`). Intelligence adds durable threads,
+message & event persistence, and analytics for your agent.
+
+- **Runtime credential:** a project-scoped key is stored as
+  `CPK_INTELLIGENCE_API_KEY` in your `.env`.
+- **Switch project:** run `copilotkit project select` from this directory.
+- **Run it:** follow "Getting Started" above — install dependencies, set your
+  keys in `.env`, then `npm run dev`.
+
+Learn more at https://docs.copilotkit.ai.
